@@ -11,8 +11,8 @@ from .config import settings
 
 logger = structlog.get_logger(__name__)
 
-_local = threading.local()
-_write_lock = threading.Lock()
+_conn: Optional[sqlite3.Connection] = None
+_lock = threading.Lock()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS logs (
@@ -48,31 +48,40 @@ END;
 
 
 def _get_conn() -> sqlite3.Connection:
-    """Get a thread-local SQLite connection."""
-    if not hasattr(_local, "conn") or _local.conn is None:
-        os.makedirs(os.path.dirname(settings.db_path), exist_ok=True)
-        conn = sqlite3.connect(settings.db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        _local.conn = conn
-    return _local.conn
+    """Get the shared SQLite connection. Creates it if needed."""
+    global _conn
+    if _conn is None:
+        os.makedirs(os.path.dirname(settings.db_path) or ".", exist_ok=True)
+        _conn = sqlite3.connect(settings.db_path, check_same_thread=False)
+        _conn.row_factory = sqlite3.Row
+        _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.execute("PRAGMA synchronous=NORMAL")
+        _conn.execute("PRAGMA busy_timeout=5000")
+    return _conn
 
 
 def init_db():
     """Create tables and FTS5 index if they don't exist."""
-    conn = _get_conn()
-    conn.executescript(SCHEMA)
-    conn.commit()
+    with _lock:
+        conn = _get_conn()
+        conn.executescript(SCHEMA)
+        conn.commit()
     logger.info("db_initialized", path=settings.db_path)
 
 
 def close_db():
-    """Close the thread-local connection."""
-    if hasattr(_local, "conn") and _local.conn is not None:
-        _local.conn.close()
-        _local.conn = None
+    """Close the shared connection."""
+    global _conn
+    with _lock:
+        if _conn is not None:
+            _conn.close()
+            _conn = None
+
+
+def reset_conn():
+    """Reset connection (for testing)."""
+    global _conn
+    _conn = None
 
 
 def insert_log(
@@ -83,11 +92,11 @@ def insert_log(
     raw: str,
     trace_id: Optional[str] = None,
 ):
-    """Insert a single log entry. Thread-safe via write lock."""
-    with _write_lock:
+    """Insert a single log entry. Thread-safe via lock."""
+    with _lock:
         conn = _get_conn()
         conn.execute(
-            "INSERT INTO logs (service, level, timestamp, trace_id, message, raw) "
+            "INSERT INTO logs (service, level, timestamp, message, raw, trace_id) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (service, level, timestamp, message, raw, trace_id),
         )
@@ -98,7 +107,7 @@ def insert_logs_batch(entries: list[dict]):
     """Insert multiple log entries in a single transaction."""
     if not entries:
         return
-    with _write_lock:
+    with _lock:
         conn = _get_conn()
         conn.executemany(
             "INSERT INTO logs (service, level, timestamp, trace_id, message, raw) "
@@ -119,79 +128,88 @@ def search_logs(
     offset: int = 0,
 ) -> list[dict]:
     """Search logs with optional FTS5 query and filters."""
-    conn = _get_conn()
-    conditions = []
-    params: list = []
+    with _lock:
+        conn = _get_conn()
+        conditions = []
+        params: list = []
 
-    if q:
-        conditions.append(
-            "logs.id IN (SELECT rowid FROM logs_fts WHERE logs_fts MATCH ?)"
+        if q:
+            conditions.append(
+                "logs.id IN (SELECT rowid FROM logs_fts WHERE logs_fts MATCH ?)"
+            )
+            params.append(q)
+        if service:
+            conditions.append("logs.service = ?")
+            params.append(service)
+        if level:
+            conditions.append("logs.level = ?")
+            params.append(level)
+        if from_ts:
+            conditions.append("logs.timestamp >= ?")
+            params.append(from_ts)
+        if to_ts:
+            conditions.append("logs.timestamp <= ?")
+            params.append(to_ts)
+        if trace_id:
+            conditions.append("logs.trace_id = ?")
+            params.append(trace_id)
+
+        where = " AND ".join(conditions) if conditions else "1=1"
+        query = (
+            f"SELECT id, service, level, timestamp, trace_id, message, raw "
+            f"FROM logs WHERE {where} "
+            f"ORDER BY timestamp DESC LIMIT ? OFFSET ?"
         )
-        params.append(q)
-    if service:
-        conditions.append("logs.service = ?")
-        params.append(service)
-    if level:
-        conditions.append("logs.level = ?")
-        params.append(level)
-    if from_ts:
-        conditions.append("logs.timestamp >= ?")
-        params.append(from_ts)
-    if to_ts:
-        conditions.append("logs.timestamp <= ?")
-        params.append(to_ts)
-    if trace_id:
-        conditions.append("logs.trace_id = ?")
-        params.append(trace_id)
+        params.extend([limit, offset])
 
-    where = " AND ".join(conditions) if conditions else "1=1"
-    query = (
-        f"SELECT id, service, level, timestamp, trace_id, message, raw "
-        f"FROM logs WHERE {where} "
-        f"ORDER BY timestamp DESC LIMIT ? OFFSET ?"
-    )
-    params.extend([limit, offset])
-
-    rows = conn.execute(query, params).fetchall()
-    return [dict(row) for row in rows]
+        rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
 
 
 def get_log_context(log_id: int, context_lines: int = 20) -> list[dict]:
     """Get surrounding log lines for a given log entry."""
-    conn = _get_conn()
-    # First get the target log's timestamp and service
-    target = conn.execute(
-        "SELECT service, timestamp FROM logs WHERE id = ?", (log_id,)
-    ).fetchone()
-    if not target:
-        return []
+    half = context_lines // 2
+    with _lock:
+        conn = _get_conn()
+        target = conn.execute(
+            "SELECT service FROM logs WHERE id = ?", (log_id,)
+        ).fetchone()
+        if not target:
+            return []
 
-    service = target["service"]
-    timestamp = target["timestamp"]
+        service = target["service"]
 
-    # Get lines around this timestamp for the same service
-    rows = conn.execute(
-        "SELECT id, service, level, timestamp, trace_id, message, raw FROM logs "
-        "WHERE service = ? AND timestamp >= ("
-        "  SELECT timestamp FROM logs WHERE service = ? "
-        "  AND timestamp <= ? ORDER BY timestamp DESC LIMIT 1 OFFSET ?"
-        ") AND timestamp <= ("
-        "  SELECT timestamp FROM logs WHERE service = ? "
-        "  AND timestamp >= ? ORDER BY timestamp ASC LIMIT 1 OFFSET ?"
-        ") ORDER BY timestamp ASC",
-        (service, service, timestamp, context_lines // 2,
-         service, timestamp, context_lines // 2),
-    ).fetchall()
-    return [dict(row) for row in rows]
+        # Get `half` lines before and after (by id) within the same service
+        before = conn.execute(
+            "SELECT id, service, level, timestamp, trace_id, message, raw FROM logs "
+            "WHERE service = ? AND id < ? ORDER BY id DESC LIMIT ?",
+            (service, log_id, half),
+        ).fetchall()
+
+        current = conn.execute(
+            "SELECT id, service, level, timestamp, trace_id, message, raw FROM logs "
+            "WHERE id = ?", (log_id,)
+        ).fetchall()
+
+        after = conn.execute(
+            "SELECT id, service, level, timestamp, trace_id, message, raw FROM logs "
+            "WHERE service = ? AND id > ? ORDER BY id ASC LIMIT ?",
+            (service, log_id, half),
+        ).fetchall()
+
+        # Combine: before (reversed to ASC order) + current + after
+        result = list(reversed(before)) + list(current) + list(after)
+        return [dict(row) for row in result]
 
 
 def get_services() -> list[str]:
     """Return distinct service names from the logs table."""
-    conn = _get_conn()
-    rows = conn.execute(
-        "SELECT DISTINCT service FROM logs ORDER BY service"
-    ).fetchall()
-    return [row["service"] for row in rows]
+    with _lock:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT DISTINCT service FROM logs ORDER BY service"
+        ).fetchall()
+        return [row["service"] for row in rows]
 
 
 def get_db_size_bytes() -> int:
@@ -204,14 +222,13 @@ def get_db_size_bytes() -> int:
 
 def delete_old_logs(before_timestamp: str) -> int:
     """Delete logs older than the given timestamp. Returns count deleted."""
-    with _write_lock:
+    with _lock:
         conn = _get_conn()
         cursor = conn.execute(
             "DELETE FROM logs WHERE timestamp < ?", (before_timestamp,)
         )
         deleted = cursor.rowcount
         if deleted > 0:
-            # Rebuild FTS5 index after bulk delete
             conn.execute("INSERT INTO logs_fts(logs_fts) VALUES ('rebuild')")
         conn.commit()
         return deleted
@@ -219,17 +236,19 @@ def delete_old_logs(before_timestamp: str) -> int:
 
 def get_latest_log_id() -> int:
     """Return the highest log id, or 0 if empty."""
-    conn = _get_conn()
-    row = conn.execute("SELECT MAX(id) as max_id FROM logs").fetchone()
-    return row["max_id"] or 0 if row else 0
+    with _lock:
+        conn = _get_conn()
+        row = conn.execute("SELECT MAX(id) as max_id FROM logs").fetchone()
+        return row["max_id"] or 0 if row else 0
 
 
 def get_logs_after(after_id: int, limit: int = 50) -> list[dict]:
     """Get log entries with id > after_id (for live tail)."""
-    conn = _get_conn()
-    rows = conn.execute(
-        "SELECT id, service, level, timestamp, trace_id, message, raw "
-        "FROM logs WHERE id > ? ORDER BY id ASC LIMIT ?",
-        (after_id, limit),
-    ).fetchall()
-    return [dict(row) for row in rows]
+    with _lock:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT id, service, level, timestamp, trace_id, message, raw "
+            "FROM logs WHERE id > ? ORDER BY id ASC LIMIT ?",
+            (after_id, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
