@@ -4,6 +4,8 @@ services:
     container_name: logstream
     ports:
       - "8210:8210"
+    group_add:
+      - "988"  # docker group GID for socket access
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - logstream_data:/data
