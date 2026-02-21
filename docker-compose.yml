@@ -1,0 +1,25 @@
+services:
+  logstream:
+    build: .
+    container_name: logstream
+    ports:
+      - "8210:8210"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - logstream_data:/data
+    environment:
+      - LOGSTREAM_ADMIN_KEY=${LOGSTREAM_ADMIN_KEY:-}
+      - LOGSTREAM_DB_PATH=/data/logstream.db
+      - LOGSTREAM_LOG_RETENTION_DAYS=7
+      - LOGSTREAM_MAX_DB_SIZE_MB=2048
+    networks:
+      - pronter_shared
+    restart: unless-stopped
+
+volumes:
+  logstream_data:
+
+networks:
+  pronter_shared:
+    external: true
+    name: pronter_shared
